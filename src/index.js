@@ -8,15 +8,50 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8000;
 
-/*
- In-memory storage
-*/
 let metrics = [];
 
 /*
  Connect to Redis
 */
 connectRedis();
+
+/*
+ ----------------------------
+ RATE LIMIT MIDDLEWARE
+ ----------------------------
+ 5 requests per 60 seconds per IP
+*/
+const RATE_LIMIT = 5;
+const WINDOW_SECONDS = 60;
+
+async function rateLimiter(req, res, next) {
+    try {
+        const ip = req.ip;
+        const key = `rate_limit:${ip}`;
+
+        const currentCount = await redisClient.incr(key);
+
+        if (currentCount === 1) {
+            await redisClient.expire(key, WINDOW_SECONDS);
+        }
+
+        if (currentCount > RATE_LIMIT) {
+            const ttl = await redisClient.ttl(key);
+
+            res.set("Retry-After", ttl);
+            return res.status(429).json({
+                error: "Too many requests. Try again later."
+            });
+        }
+
+        next();
+    } catch (error) {
+        console.error("Rate limiter error:", error);
+        return res.status(500).json({
+            error: "Internal Server Error"
+        });
+    }
+}
 
 /*
  Health Endpoint
@@ -27,8 +62,9 @@ app.get("/health", (req, res) => {
 
 /*
  POST /api/metrics
+ Rate limit applied here
 */
-app.post("/api/metrics", (req, res) => {
+app.post("/api/metrics", rateLimiter, (req, res) => {
     const { timestamp, value, type } = req.body;
 
     if (!timestamp || typeof value !== "number" || !type) {
@@ -60,7 +96,6 @@ app.get("/api/metrics/summary", async (req, res) => {
     const cacheKey = `summary:${type}`;
 
     try {
-        // 1️⃣ Check cache
         const cachedData = await redisClient.get(cacheKey);
 
         if (cachedData) {
@@ -68,7 +103,6 @@ app.get("/api/metrics/summary", async (req, res) => {
             return res.status(200).json(JSON.parse(cachedData));
         }
 
-        // 2️⃣ Compute summary
         const filteredMetrics = metrics.filter(m => m.type === type);
 
         if (filteredMetrics.length === 0) {
@@ -86,7 +120,6 @@ app.get("/api/metrics/summary", async (req, res) => {
             average_value: average
         };
 
-        // 3️⃣ Store in Redis (TTL 60 sec)
         await redisClient.setEx(cacheKey, 60, JSON.stringify(response));
 
         console.log("Computed and cached result");

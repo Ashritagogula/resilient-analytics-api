@@ -11,15 +11,16 @@ const PORT = process.env.PORT || 8000;
 let metrics = [];
 
 /*
- Connect to Redis
+ ----------------------------
+ Connect Redis
+ ----------------------------
 */
 connectRedis();
 
 /*
  ----------------------------
- RATE LIMIT MIDDLEWARE
+ RATE LIMIT
  ----------------------------
- 5 requests per 60 seconds per IP
 */
 const RATE_LIMIT = 5;
 const WINDOW_SECONDS = 60;
@@ -37,7 +38,6 @@ async function rateLimiter(req, res, next) {
 
         if (currentCount > RATE_LIMIT) {
             const ttl = await redisClient.ttl(key);
-
             res.set("Retry-After", ttl);
             return res.status(429).json({
                 error: "Too many requests. Try again later."
@@ -46,43 +46,99 @@ async function rateLimiter(req, res, next) {
 
         next();
     } catch (error) {
-        console.error("Rate limiter error:", error);
-        return res.status(500).json({
-            error: "Internal Server Error"
-        });
+        return res.status(500).json({ error: "Rate limiter failure" });
     }
 }
 
 /*
- Health Endpoint
+ ----------------------------
+ CIRCUIT BREAKER
+ ----------------------------
+*/
+const STATES = {
+    CLOSED: "CLOSED",
+    OPEN: "OPEN",
+    HALF_OPEN: "HALF_OPEN"
+};
+
+let circuitState = STATES.CLOSED;
+let failureCount = 0;
+let lastFailureTime = null;
+
+const FAILURE_THRESHOLD = 3;
+const RESET_TIMEOUT = 30000; // 30 seconds
+
+async function riskyExternalService() {
+    // 50% failure simulation
+    if (Math.random() < 0.5) {
+        throw new Error("Simulated external failure");
+    }
+    return { external_data: "success" };
+}
+
+async function callWithCircuitBreaker() {
+    if (circuitState === STATES.OPEN) {
+        const now = Date.now();
+
+        if (now - lastFailureTime > RESET_TIMEOUT) {
+            circuitState = STATES.HALF_OPEN;
+        } else {
+            throw new Error("Circuit is OPEN");
+        }
+    }
+
+    try {
+        const result = await riskyExternalService();
+
+        failureCount = 0;
+        circuitState = STATES.CLOSED;
+
+        return result;
+
+    } catch (error) {
+        failureCount++;
+
+        if (failureCount >= FAILURE_THRESHOLD) {
+            circuitState = STATES.OPEN;
+            lastFailureTime = Date.now();
+        }
+
+        throw error;
+    }
+}
+
+/*
+ ----------------------------
+ HEALTH
+ ----------------------------
 */
 app.get("/health", (req, res) => {
     res.status(200).json({ status: "OK" });
 });
 
 /*
- POST /api/metrics
- Rate limit applied here
+ ----------------------------
+ METRICS INGESTION
+ ----------------------------
 */
 app.post("/api/metrics", rateLimiter, (req, res) => {
     const { timestamp, value, type } = req.body;
 
     if (!timestamp || typeof value !== "number" || !type) {
         return res.status(400).json({
-            error: "Invalid payload. Required: timestamp (string), value (number), type (string)"
+            error: "Invalid payload"
         });
     }
 
     metrics.push({ timestamp, value, type });
 
-    return res.status(201).json({
-        message: "Metric stored successfully"
-    });
+    res.status(201).json({ message: "Metric stored successfully" });
 });
 
 /*
- GET /api/metrics/summary
- With Redis Caching
+ ----------------------------
+ SUMMARY (WITH CACHE)
+ ----------------------------
 */
 app.get("/api/metrics/summary", async (req, res) => {
     const { type } = req.query;
@@ -99,37 +155,51 @@ app.get("/api/metrics/summary", async (req, res) => {
         const cachedData = await redisClient.get(cacheKey);
 
         if (cachedData) {
-            console.log("Serving from cache");
             return res.status(200).json(JSON.parse(cachedData));
         }
 
-        const filteredMetrics = metrics.filter(m => m.type === type);
+        const filtered = metrics.filter(m => m.type === type);
 
-        if (filteredMetrics.length === 0) {
+        if (filtered.length === 0) {
             return res.status(404).json({
-                message: "No metrics found for this type"
+                message: "No metrics found"
             });
         }
 
-        const total = filteredMetrics.reduce((sum, m) => sum + m.value, 0);
-        const average = total / filteredMetrics.length;
+        const total = filtered.reduce((sum, m) => sum + m.value, 0);
+        const average = total / filtered.length;
 
         const response = {
-            type: type,
-            count: filteredMetrics.length,
+            type,
+            count: filtered.length,
             average_value: average
         };
 
         await redisClient.setEx(cacheKey, 60, JSON.stringify(response));
 
-        console.log("Computed and cached result");
-
-        return res.status(200).json(response);
+        res.status(200).json(response);
 
     } catch (error) {
-        console.error("Error in summary endpoint:", error);
-        return res.status(500).json({
-            error: "Internal Server Error"
+        res.status(500).json({ error: "Summary error" });
+    }
+});
+
+/*
+ ----------------------------
+ EXTERNAL DATA ENDPOINT
+ ----------------------------
+*/
+app.get("/api/external-data", async (req, res) => {
+    try {
+        const result = await callWithCircuitBreaker();
+        res.status(200).json({
+            circuit_state: circuitState,
+            data: result
+        });
+    } catch (error) {
+        res.status(503).json({
+            circuit_state: circuitState,
+            message: "Fallback response: External service unavailable"
         });
     }
 });

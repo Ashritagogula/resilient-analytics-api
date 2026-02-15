@@ -1,4 +1,5 @@
 const express = require("express");
+const { connectRedis } = require("./config/redis");
 require("dotenv").config();
 
 const app = express();
@@ -77,6 +78,7 @@ app.get("/api/metrics/summary", (req, res) => {
         average_value: average
     });
 });
+connectRedis();
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);

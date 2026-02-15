@@ -1,8 +1,17 @@
-version: "3.8"
-
 services:
+  app:
+    build: .
+    container_name: analytics-app
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+
   redis:
     image: redis:7-alpine
+    container_name: analytics-redis
     ports:
       - "6379:6379"
-    container_name: analytics-redis
